@@ -35,21 +35,23 @@ struct TListFileCache
 //-----------------------------------------------------------------------------
 // Local functions (cache)
 
+static char * CopyListLine(char * szListLine, const char * szFileName)
+{
+    // Copy the string
+    while(szFileName[0] != 0)
+        *szListLine++ = *szFileName++;
+
+    // Append the end-of-line
+    *szListLine++ = 0x0D;
+    *szListLine++ = 0x0A;
+    return szListLine;
+}
+
 static bool FreeListFileCache(TListFileCache * pCache)
 {
     // Valid parameter check
-    if(pCache == NULL)
-        return false;
-
-    //
-    // Note: don't close the pCache->hFile handle.
-    // This has to be done by the creator of the listfile cache
-    //
-
-    // Free all allocated buffers
-    if(pCache->szMask != NULL)
-        STORM_FREE(pCache->szMask);
-    STORM_FREE(pCache);
+    if(pCache != NULL)
+        STORM_FREE(pCache);
     return true;
 }
 
@@ -70,7 +72,7 @@ static TListFileCache * CreateListFileCache(HANDLE hListFile, const char * szMas
         nMaskLength = strlen(szMask) + 1;
 
     // Allocate cache for one file block
-    pCache = (TListFileCache *)STORM_ALLOC(BYTE, sizeof(TListFileCache));
+    pCache = (TListFileCache *)STORM_ALLOC(BYTE, sizeof(TListFileCache) + nMaskLength);
     if(pCache != NULL)
     {
         // Clear the entire structure
@@ -126,7 +128,7 @@ static DWORD ReloadListFileCache(TListFileCache * pCache)
 
         // Load the next data chunk to the cache
         SFileSetFilePointer(pCache->hFile, pCache->dwFilePos, NULL, FILE_BEGIN);
-        SFileReadFile(pCache->hFile, pCache->Buffer, CACHE_BUFFER_SIZE, &dwBytesRead, NULL);
+        SFileReadFile(pCache->hFile, pCache->Buffer, dwBytesToRead, &dwBytesRead, NULL);
 
         // If we didn't read anything, it might mean that the block
         // of the file is not available (in case of partial MPQs).
@@ -216,19 +218,91 @@ static int CompareFileNodes(const void * p1, const void * p2)
     return _stricmp(szFileName1, szFileName2);
 }
 
-static int WriteListFileLine(
-    TMPQFile * hf,
-    const char * szLine)
+static LPBYTE CreateListFile(TMPQArchive * ha, DWORD * pcbListFile)
 {
-    char szNewLine[2] = {0x0D, 0x0A};
-    size_t nLength = strlen(szLine);
-    int nError;
+    TFileEntry * pFileTableEnd = ha->pFileTable + ha->dwFileTableSize;
+    TFileEntry * pFileEntry;
+    char ** SortTable = NULL;
+    char * szListFile = NULL;
+    char * szListLine;
+    size_t nFileNodes = 0;
+    size_t cbListFile = 0;
+    size_t nIndex0;
+    size_t nIndex1;
 
-    nError = SFileAddFile_Write(hf, szLine, (DWORD)nLength, MPQ_COMPRESSION_ZLIB);
-    if(nError != ERROR_SUCCESS)
-        return nError;
+    // Allocate the table for sorting listfile
+    SortTable = STORM_ALLOC(char*, ha->dwFileTableSize);
+    if(SortTable == NULL)
+        return NULL;
 
-    return SFileAddFile_Write(hf, szNewLine, sizeof(szNewLine), MPQ_COMPRESSION_ZLIB);
+    // Construct the sort table
+    // Note: in MPQs with multiple locale versions of the same file,
+    // this code causes adding multiple listfile entries.
+    // They will get removed after the listfile sorting
+    for(pFileEntry = ha->pFileTable; pFileEntry < pFileTableEnd; pFileEntry++)
+    {
+        // Only take existing items
+        if((pFileEntry->dwFlags & MPQ_FILE_EXISTS) && pFileEntry->szFileName != NULL)
+        {
+            // Ignore pseudo-names and internal names
+            if(!IsPseudoFileName(pFileEntry->szFileName, NULL) && !IsInternalMpqFileName(pFileEntry->szFileName))
+            {
+                SortTable[nFileNodes++] = pFileEntry->szFileName;
+            }
+        }
+    }
+
+    // Remove duplicities
+    if(nFileNodes > 0)
+    {
+        // Sort the table
+        qsort(SortTable, nFileNodes, sizeof(char *), CompareFileNodes);
+
+        // Count the 0-th item
+        cbListFile += strlen(SortTable[0]) + 2;
+
+        // Walk through the items and only use the ones that are not duplicated
+        for(nIndex0 = 0, nIndex1 = 1; nIndex1 < nFileNodes; nIndex1++)
+        {
+            // If the next file node is different, we will include it to the result listfile
+            if(_stricmp(SortTable[nIndex1], SortTable[nIndex0]) != 0)
+            {
+                cbListFile += strlen(SortTable[nIndex1]) + 2;
+                nIndex0 = nIndex1;
+            }
+        }
+
+        // Now allocate buffer for the entire listfile
+        szListFile = szListLine = STORM_ALLOC(char, cbListFile + 1);
+        if(szListFile != NULL)
+        {
+            // Copy the 0-th item
+            szListLine = CopyListLine(szListLine, SortTable[0]);
+
+            // Walk through the items and only use the ones that are not duplicated
+            for(nIndex0 = 0, nIndex1 = 1; nIndex1 < nFileNodes; nIndex1++)
+            {
+                // If the next file node is different, we will include it to the result listfile
+                if(_stricmp(SortTable[nIndex1], SortTable[nIndex0]) != 0)
+                {
+                    // Copy the listfile line
+                    szListLine = CopyListLine(szListLine, SortTable[nIndex1]);
+                    nIndex0 = nIndex1;
+                }
+            }
+
+            // Sanity check - does the size match?
+            assert((size_t)(szListLine - szListFile) == cbListFile);
+        }
+    }
+
+    // Free the sort table
+    STORM_FREE(SortTable);
+
+    // Give away the listfile
+    if(pcbListFile != NULL)
+        *pcbListFile = (DWORD)cbListFile;
+    return (LPBYTE)szListFile;
 }
 
 //-----------------------------------------------------------------------------
@@ -243,7 +317,6 @@ static int SListFileCreateNodeForAllLocales(TMPQArchive * ha, const char * szFil
     TFileEntry * pFileEntry;
     TMPQHash * pFirstHash;
     TMPQHash * pHash;
-    bool bNameEntryCreated = false;
 
     // If we have HET table, use that one
     if(ha->pHetTable != NULL)
@@ -252,15 +325,14 @@ static int SListFileCreateNodeForAllLocales(TMPQArchive * ha, const char * szFil
         if(pFileEntry != NULL)
         {
             // Allocate file name for the file entry
-            AllocateFileName(pFileEntry, szFileName);
-            bNameEntryCreated = true;
+            AllocateFileName(ha, pFileEntry, szFileName);
         }
 
         return ERROR_SUCCESS;
     }
 
     // If we have hash table, we use it
-    if(bNameEntryCreated == false && ha->pHashTable != NULL)
+    if(ha->pHashTable != NULL)
     {
         // Look for the first hash table entry for the file
         pFirstHash = pHash = GetFirstHashEntry(ha, szFileName);
@@ -272,8 +344,7 @@ static int SListFileCreateNodeForAllLocales(TMPQArchive * ha, const char * szFil
             if(pHash->dwBlockIndex < pHeader->dwBlockTableSize)
             {
                 // Allocate file name for the file entry
-                AllocateFileName(ha->pFileTable + pHash->dwBlockIndex, szFileName);
-                bNameEntryCreated = true;
+                AllocateFileName(ha, ha->pFileTable + pHash->dwBlockIndex, szFileName);
             }
 
             // Now find the next language version of the file
@@ -284,123 +355,59 @@ static int SListFileCreateNodeForAllLocales(TMPQArchive * ha, const char * szFil
     return ERROR_CAN_NOT_COMPLETE;
 }
 
-// Saves the whole listfile into the MPQ.
+// Saves the whole listfile to the MPQ
 int SListFileSaveToMpq(TMPQArchive * ha)
 {
-    TFileEntry * pFileTableEnd = ha->pFileTable + ha->dwFileTableSize;
-    TFileEntry * pFileEntry;
     TMPQFile * hf = NULL;
-    char * szPrevItem;
-    char ** SortTable = NULL;
-    DWORD dwFileSize = 0;
-    size_t nFileNodes = 0;
-    size_t i;
+    LPBYTE pbListFile;
+    DWORD cbListFile = 0;
     int nError = ERROR_SUCCESS;
 
-    // Allocate the table for sorting listfile
-    SortTable = STORM_ALLOC(char*, ha->dwFileTableSize);
-    if(SortTable == NULL)
-        return ERROR_NOT_ENOUGH_MEMORY;
+    // Only save (listfile) if we should do so
+    if(ha->dwFileFlags1 == 0 || ha->dwMaxFileCount == 0)
+        return ERROR_SUCCESS;
 
-    // Construct the sort table
-    // Note: in MPQs with multiple locale versions of the same file,
-    // this code causes adding multiple listfile entries.
-    // Since those MPQs were last time used in Starcraft,
-    // we leave it as it is.
-    for(pFileEntry = ha->pFileTable; pFileEntry < pFileTableEnd; pFileEntry++)
+    // At this point, we expect to have at least one reserved entry in the file table
+    assert(ha->dwReservedFiles >= 1);
+    ha->dwReservedFiles--;
+
+    // Create the raw data that is to be written to (listfile)
+    // Note: Creating the raw data before the (listfile) has been created in the MPQ
+    // causes that the name of the listfile will not be included in the listfile itself.
+    // That is OK, because (listfile) in Blizzard MPQs does not contain it either.
+    pbListFile = CreateListFile(ha, &cbListFile);
+    if(pbListFile != NULL)
     {
-        // Only take existing items
-        if((pFileEntry->dwFlags & MPQ_FILE_EXISTS) && pFileEntry->szFileName != NULL)
-        {
-            // Ignore pseudo-names
-            if(!IsPseudoFileName(pFileEntry->szFileName, NULL) && !IsInternalMpqFileName(pFileEntry->szFileName))
-            {
-                SortTable[nFileNodes++] = pFileEntry->szFileName;
-            }
-        }
-    }
+        // We expect it to be nonzero size
+        assert(cbListFile != 0);
 
-    // Sort the table
-    qsort(SortTable, nFileNodes, sizeof(char *), CompareFileNodes);
-
-    // Now parse the table of file names again - remove duplicates
-    // and count file size.
-    if(nFileNodes != 0)
-    {
-        // Count the 0-th item
-        dwFileSize += (DWORD)strlen(SortTable[0]) + 2;
-        szPrevItem = SortTable[0];
-        
-        // Count all next items
-        for(i = 1; i < nFileNodes; i++)
-        {
-            // If the item is the same like the last one, skip it
-            if(_stricmp(SortTable[i], szPrevItem))
-            {
-                dwFileSize += (DWORD)strlen(SortTable[i]) + 2;
-                szPrevItem = SortTable[i];
-            }
-        }
-
-        // Determine the flags for (listfile)
-        if(ha->dwFileFlags1 == 0)
-            ha->dwFileFlags1 = GetDefaultSpecialFileFlags(ha, dwFileSize);
+        // Determine the real flags for (listfile)
+        if(ha->dwFileFlags1 == MPQ_FILE_EXISTS)
+            ha->dwFileFlags1 = GetDefaultSpecialFileFlags(cbListFile, ha->pHeader->wFormatVersion);
 
         // Create the listfile in the MPQ
         nError = SFileAddFile_Init(ha, LISTFILE_NAME,
                                        0,
-                                       dwFileSize,
+                                       cbListFile,
                                        LANG_NEUTRAL,
                                        ha->dwFileFlags1 | MPQ_FILE_REPLACEEXISTING,
                                       &hf);
-        // Add all file names
+
+        // Write the listfile raw data to it
         if(nError == ERROR_SUCCESS)
         {
-            // Each name is followed by newline ("\x0D\x0A")
-            szPrevItem = SortTable[0];
-            nError = WriteListFileLine(hf, SortTable[0]);
+            // Write the content of the listfile to the MPQ
+            nError = SFileAddFile_Write(hf, pbListFile, cbListFile, MPQ_COMPRESSION_ZLIB);
+            SFileAddFile_Finish(hf);
 
-            // Count all next items
-            for(i = 1; i < nFileNodes; i++)
-            {
-                // If the item is the same like the last one, skip it
-                if(_stricmp(SortTable[i], szPrevItem))
-                {
-                    WriteListFileLine(hf, SortTable[i]);
-                    szPrevItem = SortTable[i];
-                }
-            }
+            // Clear the invalidate flag
+            ha->dwFlags &= ~MPQ_FLAG_LISTFILE_INVALID;
         }
-    }
-    else
-    {
-        // Create the listfile in the MPQ
-        dwFileSize = (DWORD)strlen(LISTFILE_NAME) + 2;
-        nError = SFileAddFile_Init(ha, LISTFILE_NAME,
-                                       0,
-                                       dwFileSize,
-                                       LANG_NEUTRAL,
-                                       MPQ_FILE_ENCRYPTED | MPQ_FILE_COMPRESS | MPQ_FILE_REPLACEEXISTING,
-                                      &hf);
 
-        // Just add "(listfile)" there
-        if(nError == ERROR_SUCCESS)
-        {
-            WriteListFileLine(hf, LISTFILE_NAME);
-        }
+        // Free the listfile buffer
+        STORM_FREE(pbListFile);
     }
 
-    // Finalize the file in the MPQ
-    if(hf != NULL)
-    {
-        SFileAddFile_Finish(hf);
-    }
-    
-    // Free buffers
-    if(nError == ERROR_SUCCESS)
-        ha->dwFlags &= ~MPQ_FLAG_INV_LISTFILE;
-    if(SortTable != NULL)
-        STORM_FREE(SortTable);
     return nError;
 }
 
@@ -563,6 +570,10 @@ HANDLE WINAPI SListFileFindFirstFile(HANDLE hMpq, const char * szListFile, const
     // Perform file search
     if(nError == ERROR_SUCCESS)
     {
+        // The listfile handle is in the cache now
+        hListFile = NULL;
+
+        // Iterate through the listfile
         for(;;)
         {
             // Read the (next) line
@@ -582,12 +593,15 @@ HANDLE WINAPI SListFileFindFirstFile(HANDLE hMpq, const char * szListFile, const
     // Cleanup & exit
     if(nError != ERROR_SUCCESS)
     {
+        if(pCache != NULL)
+            FreeListFileCache(pCache);
+        pCache = NULL;
+
         memset(lpFindFileData, 0, sizeof(SFILE_FIND_DATA));
         SetLastError(nError);
     }
 
-    if(pCache != NULL)
-        FreeListFileCache(pCache);
+    // Close remaining unowned listfile handle
     if(hListFile != NULL)
         SFileCloseFile(hListFile);
     return (HANDLE)pCache;
@@ -597,34 +611,44 @@ bool WINAPI SListFileFindNextFile(HANDLE hFind, SFILE_FIND_DATA * lpFindFileData
 {
     TListFileCache * pCache = (TListFileCache *)hFind;
     size_t nLength;
-    bool bResult = false;
-    int nError = ERROR_SUCCESS;
+    int nError = ERROR_INVALID_PARAMETER;
 
-    for(;;)
+    // Check for parameters
+    if(pCache != NULL)
     {
-        // Read the (next) line
-        nLength = ReadListFileLine(pCache, lpFindFileData->cFileName, sizeof(lpFindFileData->cFileName));
-        if(nLength == 0)
+        for(;;)
         {
-            nError = ERROR_NO_MORE_FILES;
-            break;
-        }
+            // Read the (next) line
+            nLength = ReadListFileLine(pCache, lpFindFileData->cFileName, sizeof(lpFindFileData->cFileName));
+            if(nLength == 0)
+            {
+                nError = ERROR_NO_MORE_FILES;
+                break;
+            }
 
-        // If some mask entered, check it
-        if(CheckWildCard(lpFindFileData->cFileName, pCache->szMask))
-        {
-            bResult = true;
-            break;
+            // If some mask entered, check it
+            if(CheckWildCard(lpFindFileData->cFileName, pCache->szMask))
+            {
+                nError = ERROR_SUCCESS;
+                break;
+            }
         }
     }
 
     if(nError != ERROR_SUCCESS)
         SetLastError(nError);
-    return bResult;
+    return (nError == ERROR_SUCCESS);
 }
 
 bool WINAPI SListFileFindClose(HANDLE hFind)
 {
-    return FreeListFileCache((TListFileCache *)hFind);
+    TListFileCache * pCache = (TListFileCache *)hFind;
+
+    if(pCache == NULL)
+        return false;
+
+    if(pCache->hFile != NULL)
+        SFileCloseFile(pCache->hFile);
+    return FreeListFileCache(pCache);
 }
 

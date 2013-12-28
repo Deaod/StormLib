@@ -13,7 +13,9 @@ set(SRC_FILES
            src/sparse/sparse.cpp
            src/FileStream.cpp
            src/SBaseCommon.cpp
+           src/SBaseDumpData.cpp
            src/SBaseFileTable.cpp
+           src/SBaseSubTypes.cpp
            src/SCompression.cpp
            src/SFileAddFile.cpp
            src/SFileAttributes.cpp
@@ -21,6 +23,7 @@ set(SRC_FILES
            src/SFileCreateArchive.cpp
            src/SFileExtractFile.cpp
            src/SFileFindFile.cpp
+           src/SFileGetFileInfo.cpp
            src/SFileListFile.cpp
            src/SFileOpenArchive.cpp
            src/SFileOpenFileEx.cpp
@@ -223,7 +226,7 @@ set(ZLIB_BZIP2_FILES
            src/bzip2/huffman.c
            src/bzip2/randtable.c
            src/zlib/adler32.c
-           src/zlib/compress2.c
+           src/zlib/compress.c
            src/zlib/crc32.c
            src/zlib/deflate.c
            src/zlib/inffast.c
@@ -291,8 +294,8 @@ if(APPLE)
 endif()
 
 if(UNIX)
-    set_target_properties(storm PROPERTIES VERSION 8.21.0)
-    set_target_properties(storm PROPERTIES SOVERSION 8)
+    set_target_properties(storm PROPERTIES VERSION 9.0.0)
+    set_target_properties(storm PROPERTIES SOVERSION 9)
 endif()
 
 # On Win32, build StormLib.dll since we don't want to clash with Storm.dll
