@@ -267,7 +267,7 @@ static ULONGLONG DetermineArchiveSize_V1_V2(
         if(pHeader->dwBlockTablePos < pHeader->dwArchiveSize)
         {
             // If the block table end matches the archive size, we trust the archive size
-            if(pHeader->dwBlockTablePos + (pHeader->dwBlockTableSize * sizeof(TMPQBlock)) == pHeader->dwArchiveSize)
+            if((pHeader->dwArchiveSize - pHeader->dwBlockTablePos) <= (pHeader->dwBlockTableSize * sizeof(TMPQBlock)))
                 return pHeader->dwArchiveSize;
 
             // If the archive size in the header is less than real file size
@@ -431,7 +431,7 @@ int ConvertMpqHeaderToFormat4(
                 if(pHeader->HiBlockTablePos64 != 0)
                 {
                     // BlockTableSize64 may be less than TblSize * sizeof(TMPQBlock).
-                    // That means that the hi-block table is compressed.
+                    // That means that the block table is compressed.
                     pHeader->BlockTableSize64 = pHeader->HiBlockTablePos64 - BlockTablePos64;
                     assert(pHeader->BlockTableSize64 <= (pHeader->dwBlockTableSize * sizeof(TMPQBlock)));
 
