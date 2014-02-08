@@ -2269,6 +2269,12 @@ static int TestOpenArchive(const char * szPlainName, const char * szListFile = N
     return nError;
 }
 
+static int TestOpenArchive_WillFail(const char * szPlainName, const char * szListFile = NULL)
+{
+    TestOpenArchive(szPlainName, szListFile);
+    return ERROR_SUCCESS;
+}
+
 static int TestOpenArchive_Corrupt(const char * szPlainName)
 {
     TLogHelper Logger("OpenCorruptMpqTest", szPlainName);
@@ -2620,6 +2626,31 @@ static int TestOpenArchive_CraftedUserData(const char * szPlainName, const char 
     return nError;
 }
 
+
+static int TestOpenArchive_CompactingTest(const char * szPlainName)
+{
+    TLogHelper Logger("CompactingTest", szPlainName);
+    HANDLE hMpq = NULL;
+    int nError;
+
+    // Create copy of the archive, with interleaving some user data
+    nError = OpenExistingArchiveWithCopy(&Logger, szPlainName, szPlainName, &hMpq);
+    if(nError == ERROR_SUCCESS)
+    {
+        // Compact the archive
+        Logger.PrintProgress("Compacting archive %s ...", szPlainName);
+        if(!SFileSetCompactCallback(hMpq, CompactCallback, &Logger))
+            nError = Logger.PrintError("Failed to set the compact callback");
+
+        if(!SFileCompactArchive(hMpq, NULL, false))
+            nError = Logger.PrintError("Failed to compact archive %s", szPlainName);
+        
+        SFileCloseArchive(hMpq);
+    }
+
+    return nError;
+}
+
 static int ForEachFile_VerifyFileChecksum(const char * szFullPath)
 {
     const char * szShortPlainName = GetShortPlainName(szFullPath);
@@ -2820,7 +2851,7 @@ static int TestCreateArchive_FillArchive(const char * szPlainName)
     // Now we should be able to add 6 files
     if(nError == ERROR_SUCCESS)
     {
-        for(DWORD i = 0; i < dwMaxFileCount; i++)
+        for(unsigned int i = 0; i < dwMaxFileCount; i++)
         {
             sprintf(szFileName, "AddedFile%03u.txt", i);
             nError = AddFileToMpq(&Logger, hMpq, szFileName, szFileData, dwFlags, dwCompression);
@@ -2922,7 +2953,7 @@ static int TestCreateArchive_IncMaxFileCount(const char * szPlainName)
     // we increment the max file count
     if(nError == ERROR_SUCCESS)
     {
-        for(DWORD i = 0; i < 10; i++)
+        for(unsigned int i = 0; i < 10; i++)
         {
             // Open the archive again
             nError = OpenExistingArchiveWithCopy(&Logger, NULL, szPlainName, &hMpq);
@@ -3154,7 +3185,6 @@ static int TestCreateArchive_CompressionsTest(const char * szPlainName)
     DWORD dwCmprCount = sizeof(Compressions) / sizeof(DWORD);
     DWORD dwAddedFiles = 0;
     DWORD dwFoundFiles = 0;
-    DWORD i;
     int nError;
 
     // Create paths for local file to be added
@@ -3167,7 +3197,7 @@ static int TestCreateArchive_CompressionsTest(const char * szPlainName)
     if(nError == ERROR_SUCCESS)
     {
         Logger.UserTotal = dwCmprCount;
-        for(i = 0; i < dwCmprCount; i++)
+        for(unsigned int i = 0; i < dwCmprCount; i++)
         {
             sprintf(szArchivedName, "WaveFile_%02u.wav", i + 1);
             nError = AddLocalFileToMpq(&Logger, hMpq, szArchivedName, szFileName, MPQ_FILE_COMPRESS | MPQ_FILE_ENCRYPTED | MPQ_FILE_SECTOR_CRC, Compressions[i]);
@@ -3512,7 +3542,7 @@ int main(int argc, char * argv[])
     if(nError == ERROR_SUCCESS)
         nError = TestOpenArchive("MPQ_2011_v4_InvalidHetEntryCount.MPQ");
 
-    // Open an truncated archive
+    // Open a truncated archive
     if(nError == ERROR_SUCCESS)
         nError = TestOpenArchive("MPQ_2002_v1_BlockTableCut.MPQ");
 
@@ -3531,6 +3561,14 @@ int main(int argc, char * argv[])
     // Open a MPQ that actually has user data
     if(nError == ERROR_SUCCESS)
         nError = TestOpenArchive("MPQ_2010_v2_HasUserData.s2ma");
+
+    // Open an Warcraft III map locked by the Spazzler protector
+    if(nError == ERROR_SUCCESS)
+        nError = TestOpenArchive("MPQ_2002_v1_ProtectedMap_Spazzler.w3x");
+
+    // Open an Warcraft III map locked by the Spazzler protector
+    if(nError == ERROR_SUCCESS)
+        nError = TestOpenArchive("MPQ_2002_v1_ProtectedMap_BOBA.w3m");
 
     // Open a MPQ archive v 3.0
     if(nError == ERROR_SUCCESS)
@@ -3554,7 +3592,7 @@ int main(int argc, char * argv[])
 
     // Open the multi-file archive with wrong prefix to see how StormLib deals with it
     if(nError == ERROR_SUCCESS)
-        nError = TestOpenArchive("flat-file://streaming/model.MPQ.0");
+        nError = TestOpenArchive_WillFail("flat-file://streaming/model.MPQ.0");
 
     // Open an archive that is merged with multiple files
     if(nError == ERROR_SUCCESS)
@@ -3620,6 +3658,9 @@ int main(int argc, char * argv[])
     if(nError == ERROR_SUCCESS)
         nError = TestOpenArchive_CraftedUserData("MPQ_2013_v4_expansion1.MPQ", "StormLibTest_CraftedMpq3_v4.mpq");
 
+    if(nError == ERROR_SUCCESS)
+        nError = TestOpenArchive_CompactingTest("MPQ_2014_v1_MapToCompact.w3x");
+
     // Test modifying file with no (listfile) and no (attributes)
     if(nError == ERROR_SUCCESS)
         nError = TestAddFile_ListFileTest("MPQ_1997_v1_Diablo1_DIABDAT.MPQ", false, false);
@@ -3628,6 +3669,7 @@ int main(int argc, char * argv[])
     if(nError == ERROR_SUCCESS)
         nError = TestAddFile_ListFileTest("MPQ_2013_v4_SC2_EmptyMap.SC2Map", true, true);
 
+    // Test archive compacting
     // Create an empty archive v2
     if(nError == ERROR_SUCCESS)
         nError = TestCreateArchive_EmptyMpq("StormLibTest_EmptyMpq_v2.mpq", MPQ_CREATE_ARCHIVE_V2);
